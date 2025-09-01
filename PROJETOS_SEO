@@ -1,0 +1,1847 @@
+#!/usr/bin/env python3.11
+# -*- coding: utf-8 -*-
+from docx import Document
+from docx.shared import Pt
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
+import os
+import PyPDF2
+import requests
+import psycopg2
+from psycopg2 import sql
+import pandas as pd
+
+# Configurações globais
+DATABASE_CONFIG = {
+    "dbname": "seo",
+    "user": "jaugusto",  # Substitua pelo seu usuário do PostgreSQL
+    "password": "dinoboot",  # Substitua pela sua senha do PostgreSQL
+    "host": "jacac",
+    "port": "5432"
+}
+
+def conectar_banco():
+    """Conecta ao banco de dados PostgreSQL."""
+    return psycopg2.connect(**DATABASE_CONFIG)
+
+def executar_sql(conexao, comando, valores=None):
+    """Executa um comando SQL no banco de dados."""
+    with conexao.cursor() as cursor:
+        if valores:
+            cursor.execute(comando, valores)
+        else:
+            cursor.execute(comando)
+    conexao.commit()
+
+def criar_diretorios(projeto):
+    """Cria os diretórios necessários para o projeto."""
+    diretorios = [
+        f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/CIDADES",
+        f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/PALAVRAS-CHAVES",
+        f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/RESUMO",
+        f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/OUTROS",
+        f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/ARTIGOS"
+    ]
+    for diretorio in diretorios:
+        print(f"Criando diretório: {diretorio}")
+        os.makedirs(diretorio, exist_ok=True)
+
+def criar_triggers_e_funcoes(projeto):
+    """Cria triggers e funções relacionadas ao projeto."""
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    try:
+        # Nome das tabelas
+        tabela_cidades = f"{projeto}_cidades"
+        tabela_filtro2 = f"{projeto}_filtro2"
+
+        # Função para adicionar colunas dinâmicas em filtro2
+        funcao_adicionar_colunas = f"""
+        CREATE OR REPLACE FUNCTION {projeto}_adicionar_colunas_filtro2()
+        RETURNS TRIGGER AS $$
+        DECLARE
+            cidade_formatada TEXT;
+        BEGIN
+            -- Formatar o nome da cidade (minúsculas, substituir espaços por underscores)
+            cidade_formatada := LOWER(REPLACE(NEW.cidade, ' ', '_'));
+
+            -- Verificar se as colunas já existem antes de criá-las
+            IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = '{tabela_filtro2}' AND column_name = cidade_formatada || '_vol'
+            ) THEN
+                EXECUTE format('ALTER TABLE {table} ADD COLUMN %I INTEGER DEFAULT 0;', cidade_formatada || '_vol');
+            END IF;
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = '{tabela_filtro2}' AND column_name = cidade_formatada || '_seo'
+            ) THEN
+                EXECUTE format('ALTER TABLE {table} ADD COLUMN %I INTEGER DEFAULT 0;', cidade_formatada || '_seo');
+            END IF;
+
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+
+        # Trigger para chamar a função ao inserir uma nova cidade
+        trigger_adicionar_colunas = f"""
+        CREATE TRIGGER {projeto}_trigger_adicionar_colunas_filtro2
+        AFTER INSERT ON {tabela_cidades}
+        FOR EACH ROW
+        EXECUTE FUNCTION {projeto}_adicionar_colunas_filtro2();
+        """
+
+        # Função para atualizar volume_total em cidades
+        funcao_atualizar_volume_total = f"""
+        CREATE OR REPLACE FUNCTION {projeto}_atualizar_volume_total()
+        RETURNS TRIGGER AS $$
+        DECLARE
+            cidade_formatada TEXT;
+            soma_vol INTEGER;
+        BEGIN
+            -- Formatar o nome da cidade (minúsculas, substituir espaços por underscores)
+            cidade_formatada := LOWER(REPLACE(NEW.cidade, ' ', '_'));
+
+            -- Somar os valores da coluna {cidade}_vol na tabela filtro2
+            EXECUTE format('SELECT SUM(%I) FROM {table}', cidade_formatada || '_vol')
+            INTO soma_vol;
+
+            -- Atualizar a coluna volume_total na tabela cidades
+            UPDATE {tabela_cidades}
+            SET volume_total = soma_vol
+            WHERE LOWER(REPLACE(cidade, ' ', '_')) = cidade_formatada;
+
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+
+        # Trigger para chamar a função ao atualizar filtro2
+        trigger_atualizar_volume_total = f"""
+        CREATE TRIGGER {projeto}_trigger_atualizar_volume_total
+        AFTER INSERT OR UPDATE ON {tabela_filtro2}
+        FOR EACH ROW
+        EXECUTE FUNCTION {projeto}_atualizar_volume_total();
+        """
+
+        # Executar os comandos SQL
+        executar_sql(conexao, funcao_adicionar_colunas)
+        executar_sql(conexao, trigger_adicionar_colunas)
+        executar_sql(conexao, funcao_atualizar_volume_total)
+        executar_sql(conexao, trigger_atualizar_volume_total)
+
+        print("Triggers e funções criados com sucesso.")
+
+    except Exception as e:
+        print(f"Erro ao criar triggers e funções: {e}")
+
+    finally:
+        # Fechar a conexão com o banco de dados
+        conexao.close()
+
+
+def criar_tabelas(projeto):
+    """Cria as tabelas no banco de dados individualmente."""
+    # Lista de comandos SQL para criar as tabelas
+    tabelas = [
+        f"""
+        CREATE TABLE IF NOT EXISTS {projeto}_servicos (
+            id SERIAL PRIMARY KEY,
+            servico TEXT UNIQUE,
+            usar BOOLEAN DEFAULT True
+        );
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {projeto}_concorrentes_nomes (
+            id SERIAL PRIMARY KEY,
+            concorrente TEXT UNIQUE,
+            usar BOOLEAN DEFAULT TRUE
+        );
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {projeto}_filtro1 (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT UNIQUE,
+            Search_Volume BIGINT,
+            Keyword_Difficulty BIGINT,
+            Keyword_Intents TEXT,
+            can_be_used BOOLEAN DEFAULT false
+        );
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {projeto}_concorrentes_palavras (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT,
+            Position INTEGER,
+            PreviousPosition REAL,
+            Search_Volume BIGINT,
+            Keyword_Difficulty BIGINT,
+            CPC REAL,
+            Keyword_Intents TEXT,
+            URL TEXT,
+            TrafficChange REAL,
+            TrafficPercent REAL,
+            TrafficCost REAL,
+            Competition REAL,
+            NumberOfResults BIGINT,
+            Trends TEXT,
+            Timestamp TEXT,
+            PositionType TEXT,
+            KeywordSERPFeaturesNew TEXT,
+            KeywordSERPFeaturesLost TEXT
+        );
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {projeto}_cidades (
+            id SERIAL PRIMARY KEY,
+            cidade TEXT UNIQUE,
+            estado TEXT,
+            milhas DECIMAL DEFAULT 0,
+            volume_total INTEGER,
+            usar BOOLEAN DEFAULT False,
+            pesquisado BOOLEAN DEFAULT False
+        );
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {projeto}_palavras_por_cidade (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT UNIQUE,
+            total_search INTEGER,
+            tipo TEXT,
+            usar BOOLEAN
+        );
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {projeto}_artigos (
+            id SERIAL PRIMARY KEY,
+            primary_keyword TEXT,
+            primary_volume INTEGER,
+            secondary_keyword TEXT,
+            secondary_volume INTEGER,
+            both_volume INTEGER,
+            article_topic TEXT,
+            subtopic_of_the_article TEXT,
+            seo_title TEXT,
+            reason_for_choice TEXT,
+            purpose_of_the_article TEXT,
+            publication_date DATE,
+            article_created BOOLEAN
+        );
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {projeto}_filtro2 (
+            id SERIAL PRIMARY KEY,
+            keyword TEXT UNIQUE,
+            can_be_used BOOLEAN DEFAULT False,
+            service TEXT,
+            total_search INTEGER,
+            total_volume INTEGER
+        );
+        """
+    ]
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    try:
+        # Criar cada tabela individualmente
+        for sql in tabelas:
+            try:
+                print(f"Executando SQL: {sql}")  # Log para depuração
+                executar_sql(conexao, sql)
+                print("Tabela criada com sucesso.")
+            except Exception as e:
+                print(f"Erro ao criar tabela: {e}")
+
+        # Criar triggers e funções após as tabelas
+        criar_triggers_e_funcoes(projeto)
+
+    finally:
+        # Fechar a conexão com o banco de dados
+        conexao.close()
+
+def drop_tabelas(projeto):
+    conexao = conectar_banco()
+    print(f"Removendo as tabelas do projeto {projeto}")
+    
+    # Usando f-strings para formatar as queries SQL
+    sql = f"""DROP TABLE IF EXISTS          {projeto}_filtro1;"""
+    executar_sql(conexao, sql)
+    
+    sql = f"""DROP TABLE IF EXISTS          {projeto}_filtro2;"""
+    executar_sql(conexao, sql)
+    
+    sql = f"""DROP TABLE IF EXISTS          {projeto}_cidades;"""
+    executar_sql(conexao, sql)
+    
+    sql = f"""DROP TABLE IF EXISTS          {projeto}_palavras_por_cidade;"""
+    executar_sql(conexao, sql)
+    
+    sql = f"""DROP TABLE IF EXISTS          {projeto}_artigos;"""
+    executar_sql(conexao, sql)
+    
+    sql = f"""DROP TABLE IF EXISTS          {projeto}_concorrentes_palavras;"""
+    executar_sql(conexao, sql)
+    
+    sql = f"""DROP TABLE IF EXISTS          {projeto}_concorrentes_nomes;"""
+    executar_sql(conexao, sql)
+    
+    sql = f"""DROP TABLE IF EXISTS          {projeto}_servicos;"""
+    executar_sql(conexao, sql)
+    
+    
+    conexao.close()
+
+def inserir_servicos(projeto):
+    """Processa arquivos CSV e insere dados na tabela de concorrentes."""
+    # Diretórios e tabelas
+    lista_servicos = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/OUTROS/SERVICOS.txt"
+    tabela_servicos = f"{projeto}_servicos".lower()
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    try:
+        # Inserir serviços
+        if os.path.exists(lista_servicos):
+            print(f"Processando arquivo de serviços: {lista_servicos}")
+            with open(lista_servicos, "r") as arquivo:
+                for linha in arquivo:
+                    servico = linha.strip()
+                    
+                    # Ignorar linhas vazias ou inválidas
+                    if not servico:
+                        continue
+                    
+                    # Construir o comando SQL com segurança
+                    comando = sql.SQL("""
+                        INSERT INTO {table} (servico)
+                        VALUES (%s)
+                        ON CONFLICT (servico) DO NOTHING;
+                    """).format(table=sql.Identifier(tabela_servicos))
+                    
+                    # Executar o comando SQL
+                    executar_sql(conexao, comando, (servico,))
+                    print(f"Inserido o serviço: {servico}")
+        else:
+            print(f"Arquivo de serviços não encontrado: {lista_servicos}")
+
+    except Exception as e:
+        print(f"Erro ao processar serviços: {e}")
+    
+    finally:
+        # Fechar a conexão com o banco de dados
+        if conexao:
+            conexao.close()
+            print("Conexão com o banco de dados fechada.")
+
+def INSERIR_CIDADES(projeto):
+    """Processa um arquivo com cidades e estados e insere os dados na tabela."""
+    # Diretório do arquivo
+    lista_cidades = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/OUTROS/CIDADES.txt"
+    tabela_cidades = f"{projeto}_cidades".lower()
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    try:
+        # Verificar se o arquivo existe
+        if not os.path.exists(lista_cidades):
+            print(f"Arquivo não encontrado: {lista_cidades}")
+            return
+
+        # Abrir o arquivo e processar cada linha
+        with open(lista_cidades, "r") as arquivo:
+            for linha in arquivo:
+                # Remover espaços em branco e separar cidade e estado
+                linha = linha.strip()
+                if ", " in linha:
+                    cidade, estado = linha.split(", ", 1)
+                    cidade = cidade.strip()
+                    estado = estado.strip()
+
+                    # Comando SQL para inserir cidade e estado
+                    comando = sql.SQL(""" INSERT INTO {table} (cidade, estado)  VALUES (%s, %s)  ON CONFLICT (cidade) DO NOTHING; """).format(table=sql.Identifier(tabela_cidades))
+
+                    # Executar o comando SQL
+                    executar_sql(conexao, comando, (cidade, estado))
+                    print(f"Inserido: cidade='{cidade}', estado='{estado}'")
+                    # Criar triggers e funções após a inserção das cidades
+                    #criar_triggers_e_funcoes(projeto)
+                else:
+                    print(f"Linha mal formatada: {linha}")
+
+    except Exception as e:
+        print(f"Erro ao processar o arquivo ou inserir dados: {e}")
+
+    finally:
+        # Fechar a conexão com o banco de dados
+        conexao.close()
+
+
+def inserir_concorrentes_nomes(projeto):
+    """Processa arquivos CSV e insere dados na tabela de concorrentes."""
+    # Diretórios e tabelas
+    lista_concorrentes_palavras = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/OUTROS/CONCORRENTES.txt"
+    tabela_concorrentes_nomes = f"{projeto}_concorrentes_nomes".lower() 
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+    # Inserir concorrentes da lista CONCORRENTES.txt
+    if os.path.exists(lista_concorrentes_palavras):
+        with open(lista_concorrentes_palavras, "r") as arquivo:
+            for linha in arquivo:
+                concorrente = linha.strip()
+                if concorrente:
+                    concorrente = concorrente.replace("www.", "").replace("https://", "").replace("http://", "").replace("/", "")
+                    comando = sql.SQL("""
+                        INSERT INTO {table} (concorrente) VALUES (%s) ON CONFLICT (concorrente) DO NOTHING;
+                    """).format(table=sql.Identifier(tabela_concorrentes_nomes))
+                    executar_sql(conexao, comando, (concorrente,))
+                    print(f"Inserido concorrente: {concorrente}")
+    conexao.close()
+
+
+def inserir_concorrentes_palavras(projeto):
+    dir_filtro1 = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/PALAVRAS-CHAVES"
+    tabela_concorrentes_palavras = f"{projeto}_concorrentes_palavras".lower()
+    conexao = conectar_banco()
+    
+    print(f"Processando arquivos em: {dir_filtro1}")
+    for arquivo in os.listdir(dir_filtro1):
+        if not arquivo.endswith(".csv"):
+            continue
+            
+        caminho_arquivo = os.path.join(dir_filtro1, arquivo)
+        print(f"Processando arquivo: {caminho_arquivo}")
+        
+        try:
+            # Ler o arquivo CSV
+            df = pd.read_csv(caminho_arquivo)
+            
+            # Converter NaN para None - CORREÇÃO AQUI (usando o DataFrame df que acabou de ser criado)
+            df = df.where(pd.notnull(df), None)
+            
+            print("Colunas do CSV:", df.columns.tolist())
+            
+            for _, row in df.iterrows():
+                try:
+                    # Preparar os valores para inserção
+                    valores = (
+                        row.get("Keyword"),
+                        int(row.get("Position", 0)) if row.get("Position") is not None else None,
+                        float(row.get("Previous position", 0.0)) if row.get("Previous position") is not None else None,
+                        int(row.get("Search Volume", 0)) if row.get("Search Volume") is not None else None,
+                        float(row.get("Keyword Difficulty", 0)) if row.get("Keyword Difficulty") is not None else None,
+                        float(row.get("CPC", 0.0)) if row.get("CPC") is not None else None,
+                        row.get("Keyword Intents"),
+                        row.get("URL"),
+                        float(row.get("Traffic", 0.0)) if row.get("Traffic") is not None else None,
+                        float(row.get("Traffic (%)", 0.0)) if row.get("Traffic (%)") is not None else None,
+                        float(row.get("Traffic Cost", 0.0)) if row.get("Traffic Cost") is not None else None,
+                        float(row.get("Competition", 0.0)) if row.get("Competition") is not None else None,
+                        str(row.get("Number of Results")) if row.get("Number of Results") is not None else None,
+                        row.get("Trends"),
+                        row.get("Timestamp"),
+                        row.get("Position Type"),
+                        row.get("SERP Features by Keyword"),
+                        None
+                    )
+                    
+                    print("Valores a serem inseridos:", valores)
+                    
+                    query = sql.SQL("""
+                        INSERT INTO {} (
+                            keyword, Position, PreviousPosition, Search_Volume, Keyword_Difficulty, CPC,
+                            Keyword_Intents, URL, TrafficChange, TrafficPercent, TrafficCost, Competition,
+                            NumberOfResults, Trends, Timestamp, PositionType, KeywordSERPFeaturesNew, KeywordSERPFeaturesLost
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                    """).format(sql.Identifier(tabela_concorrentes_palavras))
+                    
+                    # Executar com transação isolada
+                    with conexao:
+                        with conexao.cursor() as cursor:
+                            cursor.execute(query, valores)
+                            
+                except Exception as linha_error:
+                    print(f"Erro ao inserir linha: {linha_error}")
+                    print(f"Linha problemática: {row.to_dict() if 'row' in locals() else 'N/A'}")
+                    continue
+                    
+        except Exception as arquivo_error:
+            print(f"Erro ao processar arquivo {caminho_arquivo}: {arquivo_error}")
+            continue
+            
+    if conexao:
+        conexao.close()
+    print("Processamento concluído.")
+
+def pesquisa_cidades(projeto):
+    """Processa arquivos CSV no diretório de cidades e insere dados na tabela de cidades."""
+    # Diretório de cidades
+    dir_cidades = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/CIDADES"
+    tabela_cidades = f"{projeto}_cidades".lower()
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    # Processar cada arquivo CSV no diretório de cidades
+    for arquivo_csv in os.listdir(dir_cidades):
+        if arquivo_csv.endswith(".csv"):
+            # Extrair o nome da cidade do nome do arquivo
+            cidade = arquivo_csv.replace(".csv", "").replace("ubersuggest_", "").replace("_", " ")
+
+            # Comando SQL para inserir a cidade na tabela
+            comando = sql.SQL("""
+                INSERT INTO {table} (cidade, usar, pesquisado)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (cidade) DO NOTHING;
+            """).format(table=sql.Identifier(tabela_cidades))
+
+            # Executar o comando SQL
+            valores = (cidade, False, False)
+            executar_sql(conexao, comando, valores)
+            print(f"Inserida cidade: {cidade}")
+
+    # Fechar a conexão com o banco de dados
+    conexao.close()
+    print("Dados de cidades inseridos com sucesso.")
+
+def PESQUISA(projeto):
+    """Processa arquivos CSV no diretório de cidades e insere dados na tabela de pesquisa."""
+    # Diretórios e tabelas
+    dir_cidades = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/CIDADES"
+    tabela_palavras_por_cidade = f"{projeto}_palavras_por_cidade".lower()
+    tabela_cidades = f"{projeto}_cidades".lower()
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    # Reiniciar a sequência da tabela de pesquisa
+    comando = sql.SQL("ALTER SEQUENCE {seq} RESTART WITH 1;").format(seq=sql.Identifier(f"{tabela_palavras_por_cidade}_id_seq"))
+    executar_sql(conexao, comando)
+
+    # Limpar a tabela de pesquisa
+    comando = sql.SQL("DELETE FROM {table};").format(table=sql.Identifier(tabela_palavras_por_cidade))
+    executar_sql(conexao, comando)
+
+    # Processar cada arquivo CSV no diretório de cidades
+    for arquivo_csv in os.listdir(dir_cidades):
+        if arquivo_csv.endswith(".csv"):
+            # Extrair o nome da cidade do nome do arquivo
+            cidade = arquivo_csv.replace(".csv", "").replace("ubersuggest_", "").replace("_", " ")
+
+            # Obter o ID da cidade no banco de dados
+            comando = sql.SQL("SELECT id FROM {table} WHERE cidade = %s;").format(table=sql.Identifier(tabela_cidades))
+            with conexao.cursor() as cursor:
+                cursor.execute(comando, (cidade,))
+                resultado = cursor.fetchone()
+                if resultado:
+                    cidade_id = resultado[0]
+                else:
+                    print(f"Cidade não encontrada: {cidade}")
+                    continue
+
+            # Criar colunas dinâmicas para a cidade na tabela de pesquisa
+            coluna_cidade = f"cidade_{cidade_id}"
+            coluna_diff = f"SEO_d_{cidade_id}"
+
+            # Remover colunas existentes (se houver)
+            comando = sql.SQL("ALTER TABLE {table} DROP COLUMN IF EXISTS {col};").format(
+                table=sql.Identifier(tabela_palavras_por_cidade),
+                col=sql.Identifier(coluna_cidade)
+            )
+            executar_sql(conexao, comando)
+
+            comando = sql.SQL("ALTER TABLE {table} DROP COLUMN IF EXISTS {col};").format(
+                table=sql.Identifier(tabela_palavras_por_cidade),
+                col=sql.Identifier(coluna_diff)
+            )
+            executar_sql(conexao, comando)
+
+            # Adicionar novas colunas
+            comando = sql.SQL("ALTER TABLE {table} ADD COLUMN {col} INTEGER;").format(
+                table=sql.Identifier(tabela_palavras_por_cidade),
+                col=sql.Identifier(coluna_cidade)
+            )
+            executar_sql(conexao, comando)
+
+            comando = sql.SQL("ALTER TABLE {table} ADD COLUMN {col} INTEGER;").format(
+                table=sql.Identifier(tabela_palavras_por_cidade),
+                col=sql.Identifier(coluna_diff)
+            )
+            executar_sql(conexao, comando)
+
+            # Processar o arquivo CSV
+            caminho_arquivo = os.path.join(dir_cidades, arquivo_csv)
+            try:
+                df = pd.read_csv(caminho_arquivo)
+            except Exception as e:
+                print(f"Erro ao ler o arquivo CSV: {e}")
+                continue
+
+            # Iterar sobre as linhas do DataFrame
+            for _, row in df.iterrows():
+                keyword = str(row.get("Keyword", "")).replace("'", "''")
+                search = str(row.get("Search Volume", 0))
+                diff = str(row.get("SEO Difficulty", 0))
+
+                # Inserir ou atualizar a palavra-chave na tabela de pesquisa
+                comando = sql.SQL("""
+                    INSERT INTO {table} (keyword, total_search, usar)
+                    VALUES (%s, 0, FALSE)
+                    ON CONFLICT (keyword) DO NOTHING;
+                """).format(table=sql.Identifier(tabela_palavras_por_cidade))
+                executar_sql(conexao, comando, (keyword,))
+
+                comando = sql.SQL("""
+                    UPDATE {table}
+                    SET {cidade_col} = %s, {diff_col} = %s, usar = FALSE
+                    WHERE keyword = %s;
+                """).format(
+                    table=sql.Identifier(tabela_palavras_por_cidade),
+                    cidade_col=sql.Identifier(coluna_cidade),
+                    diff_col=sql.Identifier(coluna_diff)
+                )
+                executar_sql(conexao, comando, (search, diff, keyword))
+
+                comando = sql.SQL("""
+                    UPDATE {table}
+                    SET total_search = COALESCE(total_search, 0) + %s
+                    WHERE keyword = %s;
+                """).format(table=sql.Identifier(tabela_palavras_por_cidade))
+                executar_sql(conexao, comando, (search, keyword))
+
+            # Marcar a cidade como pesquisada
+            comando = sql.SQL("UPDATE {table} SET pesquisado = TRUE WHERE cidade = %s;").format(
+                table=sql.Identifier(tabela_cidades)
+            )
+            executar_sql(conexao, comando, (cidade,))
+
+    # Fechar a conexão com o banco de dados
+    conexao.close()
+    print("Dados inseridos com sucesso na tabela de pesquisa.")
+
+
+def FILTRO2(projeto):
+    """Você é um agente de IA especializado em copywriting e SEO. Sua tarefa é analisar palavras-chave e determinar se elas são relevantes para a construção de um site"""
+    """/set parameter temperature 0.5 """
+    """Função para interagir com o Ollama e processar palavras-chave."""
+    # Configurações do Ollama
+    OLLAMA_HOST = "http://10.120.120.7:11434"  # Substitua pelo host correto
+    MODELO = "gemma3:12b"
+    MODELO = "gemma2:9b"
+#    MODELO = "llama3.1:8b"
+    TEMPERATURA = 0.2  # Temperatura para controlar a criatividade das respostas
+    BRIEFING_FILE = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/OUTROS/BRIEFING.txt"
+    tabela_filtro1 = f"{projeto}_filtro1".lower()
+    tabela_filtro2 = f"{projeto}_filtro2".lower()
+    
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    try:
+        # 1. Verificar se o Ollama está rodando
+        response = requests.get(f"{OLLAMA_HOST}/api/tags")
+        if response.status_code != 200:
+            print(f"Erro ao conectar ao Ollama: {response.status_code} - {response.text}")
+            return
+
+        print("Conexão com o Ollama estabelecida com sucesso.")
+
+        # 2. Carregar o agente fixo (agente_SEO)
+        response = requests.post(f"{OLLAMA_HOST}/api/generate", json={
+            "model": MODELO,
+            "prompt": "Carregando o modelos de IA...",
+            "stream": False,
+            "temperature": TEMPERATURA  # Definindo a temperatura
+        })
+        if response.status_code == 200:
+            print(f"Modelo {MODELO} carregado com sucesso.")
+        else:
+            print(f"Erro ao carregar o modelo: {response.status_code} - {response.text}")
+            return
+
+        # 3. Carregar os dados do arquivo BRIEFING.txt
+        try:
+            with open(BRIEFING_FILE, "r") as arquivo:
+                briefing = arquivo.read()
+            print("Briefing carregado com sucesso.")
+        except Exception as e:
+            print(f"Erro ao carregar o briefing: {e}")
+            return
+
+        # 4. Verificar cada uma das linhas (keyword) da tabela {projeto}_filtro1
+        comando = sql.SQL("SELECT keyword FROM {table} ORDER BY search_volume DESC LIMIT 1000;").format(
+            table=sql.Identifier(tabela_filtro1)
+        )
+        with conexao.cursor() as cursor:
+            cursor.execute(comando)
+            keywords = cursor.fetchall()
+
+        for keyword in keywords:
+            keyword = keyword[0]
+
+            # Verificar se a palavra-chave contém nomes de cidades ou lugares (exemplo simples)
+            if any(caractere in keyword.lower() for caractere in ["city", "town", "place", "location"]):
+                print(f"Palavra-chave '{keyword}' contém nome de cidade/lugar. Ignorando.")
+                continue
+
+            # Criar o prompt para o agente SEO
+            prompt = f"""
+            Você é um agente de IA especializado em copywriting e SEO. 
+            Sua tarefa é analisar a palavra-chave e determinar se faz sentido usá-la para a construção do site do cliente.
+
+            O briefing do cliente é:
+            {briefing}
+
+            De acordo com os dados do cliente, diga se a palavra-chave '{keyword}' é relevante para a construção do site? 
+
+            Responda apenas com SIM ou NÃO.
+            """
+            
+            prompt2 = f"""Você é um especialista em copywriting e SEO, com foco em análise de palavras-chave e estratégias de conteúdo. Sua tarefa é avaliar se a palavra-chave fornecida é relevante para a construção do site do cliente, com base no briefing fornecido.
+
+            Instruções:
+                Analise o briefing do cliente:
+                    {briefing}
+
+                Avalie a palavra-chave '{keyword}' considerando:
+                --> Adequação ao nicho do cliente.
+                --> Potencial de tráfego e conversão.
+                --> Alinhamento com os objetivos do site.
+                --> Responda apenas com SIM ou NÃO, indicando se a palavra-chave é relevante para a construção do site.  """
+
+            # Enviar o prompt para o agente SEO
+            response = requests.post(f"{OLLAMA_HOST}/api/generate", json={
+                "model": MODELO,
+                "prompt": prompt2,
+                "stream": False,
+                "temperature": TEMPERATURA  # Definindo a temperatura
+            })
+            if response.status_code == 200:
+                resposta = response.json().get("response", "").strip().upper()
+                if resposta == "SIM":
+                    # Atualizar a tabela {projeto}_filtro1
+                    comando = sql.SQL("UPDATE {table} SET can_be_used = TRUE WHERE keyword = %s;").format(
+                        table=sql.Identifier(tabela_filtro1)
+                    )
+                    executar_sql(conexao, comando, (keyword,))
+                    print(f"Palavra-chave '{keyword}' marcada como TRUE.")
+                else:
+                    print(f"Palavra-chave '{keyword}' não é relevante.")
+            else:
+                print(f"Erro ao consultar o modelo para a palavra-chave '{keyword}': {response.status_code} - {response.text}")
+
+        # 5. Inserir as 1000 primeiras palavras-chave marcadas como TRUE na tabela {projeto}_filtro2
+        comando = sql.SQL("""
+            INSERT INTO {table_filtro2} (keyword, service, total_search)
+            SELECT keyword, 'SEO', search_volume
+            FROM {table_filtro1}
+            WHERE can_be_used = TRUE
+            ORDER BY search_volume DESC
+            LIMIT 1000
+            ON CONFLICT (keyword) DO NOTHING;
+        """).format(
+            table_filtro2=sql.Identifier(tabela_filtro2),
+            table_filtro1=sql.Identifier(tabela_filtro1)
+        )
+        executar_sql(conexao, comando)
+        print("Palavras-chave relevantes inseridas na tabela filtro2.")
+
+    except Exception as e:
+        print(f"Erro durante o processo: {e}")
+    finally:
+        # Fechar a conexão com o banco de dados
+        conexao.close()
+        print("Processo concluído.")
+
+def FILTRO3(projeto):
+    """Atualiza a coluna 'service' na tabela {projeto}_filtro2 com base nos serviços prestados, usando o Ollama."""
+    # Configurações do Ollama
+    OLLAMA_HOST = "http://10.120.120.7:11434"  # Substitua pelo host correto
+    AGENTE_NOME = "agente_SEO"  # Nome do agente fixo
+    MODELO= "gemma3:12b"  # Nome do agente fixo
+    TEMPERATURA = 0.2  # Temperatura para controlar a criatividade das respostas
+
+    # Diretório do projeto
+    dir_outros = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/OUTROS"
+    caminho_palavras_extras = os.path.join(dir_outros, "PALAVRAS-EXTRAS.txt")
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    # Garantir que o nome da tabela esteja em minúsculas
+    tabela_filtro2 = f"{projeto}_filtro2".lower()
+    tabela_servicos = f"{projeto}_servicos".lower()
+
+    try:
+        # 1. Verificar se o arquivo PALAVRAS-EXTRAS.txt existe
+        if os.path.exists(caminho_palavras_extras):
+            print(f"Arquivo PALAVRAS-EXTRAS.txt encontrado. Processando...")
+            with open(caminho_palavras_extras, "r") as arquivo:
+                for linha in arquivo:
+                    palavra_chave = linha.strip().lower()  # Remove espaços em branco e quebras de linha
+                    if palavra_chave:  # Verifica se a linha não está vazia
+                        # Inserir a palavra-chave na tabela {projeto}_filtro2, ignorando se já existir
+                        comando = sql.SQL("""
+                            INSERT INTO {table} (keyword)
+                            VALUES (%s)
+                            ON CONFLICT (keyword) DO NOTHING;
+                        """).format(table=sql.Identifier(tabela_filtro2))
+                        executar_sql(conexao, comando, (palavra_chave,))
+                        print(f"Palavra-chave '{palavra_chave}' adicionada à tabela filtro2.")
+        else:
+            print(f"Arquivo PALAVRAS-EXTRAS.txt não encontrado. Pulando esta etapa.")
+
+        # 2. Ler os serviços da tabela {projeto}_servicos
+        comando = sql.SQL("SELECT servico FROM {table};").format(
+            table=sql.Identifier(tabela_servicos)
+        )
+        with conexao.cursor() as cursor:
+            cursor.execute(comando)
+            servicos = [row[0] for row in cursor.fetchall()]
+
+        print(f"Serviços carregados: {servicos}")
+
+        # 3. Ler todas as keywords da tabela {projeto}_filtro2
+        comando = sql.SQL("SELECT keyword FROM {table};").format(
+            table=sql.Identifier(tabela_filtro2)
+        )
+        with conexao.cursor() as cursor:
+            cursor.execute(comando)
+            keywords = [row[0] for row in cursor.fetchall()]
+
+        print(f"Keywords encontradas: {keywords}")
+
+        # 4. Verificar se o Ollama está rodando
+        response = requests.get(f"{OLLAMA_HOST}/api/tags")
+        if response.status_code != 200:
+            print(f"Erro ao conectar ao Ollama: {response.status_code} - {response.text}")
+            return
+
+        print("Conexão com o Ollama estabelecida com sucesso.")
+
+        # 5. Para cada keyword, verificar a relação com os serviços usando o Ollama
+        for keyword in keywords:
+            # Verificar se a keyword contém nome de cidade ou local (ignorar)
+            if any(caractere in keyword.lower() for caractere in ["city", "town", "place", "location", "cidade", "local"]):
+                print(f"Keyword '{keyword}' contém nome de cidade/local. Ignorando.")
+                continue
+
+            # Criar o prompt para o agente SEO
+            prompt = f"""
+            Você é um agente de IA especializado em copywriting e SEO. Sua tarefa é analisar palavras-chave e determinar se elas são relevantes para a construção de um site.
+Entendi! 
+            A empresa presta os seguintes serviços: {', '.join(servicos)}.
+
+            A palavra-chave '{keyword}' está relacionada a algum desses serviços?
+
+            Se a palavra-chave se encaixar em mais de um serviço, escreva os serviços em uma única linha separada por ",".
+            
+            Caso não tenha relação, responda apenas com "SEM RELACAO".
+
+            Caso a palavra-chave tenha nomes de cidades, estados ou nomes de pessoas, escreva "IGNORADO"
+            
+            Responda apenas com os nomes dos serviços, "IGNORADO" ou "SEM RELACAO".
+            """
+
+            prompt2 = f"""Você é um especialista em copywriting e SEO, com foco em análise de palavras-chave e estratégias de conteúdo. Sua tarefa é avaliar se a palavra-chave fornecida está relacionada aos serviços oferecidos pela empresa.
+
+            Instruções:
+            -->     Analise os serviços da empresa:
+                    {', '.join(servicos)}
+
+            -->     Avalie a palavra-chave '{keyword}' com base nas seguintes regras:
+            -->     Se a palavra-chave estiver relacionada a um ou mais serviços, liste os serviços correspondentes, separados por vírgula.
+            -->     Se a palavra-chave não tiver relação com nenhum serviço, responda "SEM RELACAO".
+            -->     Se a palavra-chave contiver nomes de cidades, estados ou pessoas, responda "IGNORADO".
+            
+            Formato da resposta:
+            -->     Responda apenas com os nomes dos serviços, "IGNORADO" ou "SEM RELACAO".
+            -->     Não inclua explicações, comentários ou textos adicionais.  """
+
+
+            # Enviar o prompt para o agente SEO
+            response = requests.post(f"{OLLAMA_HOST}/api/generate", json={
+                "model": MODELO,
+                "prompt": prompt2,
+                "stream": False,
+                "temperature": TEMPERATURA  # Definindo a temperatura
+            })
+
+            if response.status_code == 200:
+                resposta = response.json().get("response", "").strip()
+                print(f"Resposta do Ollama para '{keyword}': {resposta}")
+
+                # 6. Atualizar a coluna 'service' na tabela {projeto}_filtro2
+                comando = sql.SQL("""
+                    UPDATE {table}
+                    SET service = %s
+                    WHERE keyword = %s;
+                """).format(table=sql.Identifier(tabela_filtro2))
+
+                executar_sql(conexao, comando, (resposta, keyword))
+                print(f"Keyword '{keyword}' atualizada com serviço: {resposta}")
+                print("")
+            else:
+                print(f"Erro ao consultar o agente para a palavra-chave '{keyword}': {response.status_code} - {response.text}")
+
+    except Exception as e:
+        print(f"Erro durante o processo: {e}")
+    finally:
+        # Fechar a conexão com o banco de dados
+        conexao.close()
+        print("Processo concluído.")
+
+def FILTRO4(projeto):
+    """Atualiza a tabela {projeto}_filtro2 com dados de volume e SEO das cidades."""
+    # Diretórios e tabelas
+    dir_cidades = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/CIDADES"
+    tabela_cidades = f"{projeto}_cidades".lower()
+    tabela_filtro2 = f"{projeto}_filtro2".lower()
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    try:
+        # 1. Zerar a coluna total_search antes de processar os dados
+        comando = sql.SQL("UPDATE {table} SET total_search = 0;").format(
+            table=sql.Identifier(tabela_filtro2)
+        )
+        executar_sql(conexao, comando)
+        print("Coluna total_search zerada com sucesso.")
+
+        # 2. Ler a lista de cidades da tabela {projeto}_cidades
+        comando = sql.SQL("SELECT cidade FROM {table};").format(
+            table=sql.Identifier(tabela_cidades)
+        )
+        with conexao.cursor() as cursor:
+            cursor.execute(comando)
+            cidades = [row[0].split(",")[0].strip() for row in cursor.fetchall()]  # Extrai apenas o nome da cidade
+
+        # 3. Adicionar colunas cidade_vol e cidade_seo na tabela {projeto}_filtro2
+        for cidade in cidades:
+            # Normalizar o nome da cidade: remover caracteres especiais, substituir espaços por "_" e converter para minúsculas
+            cidade_limpa = cidade.replace("'", "").replace('"', "").replace(" ", "_").replace(".", "").lower()
+            coluna_vol = f"{cidade_limpa}_vol"
+            coluna_seo = f"{cidade_limpa}_seo"
+
+            # Verificar se as colunas já existem e removê-las se necessário
+            comando = sql.SQL("ALTER TABLE {table} DROP COLUMN IF EXISTS {col};").format(
+                table=sql.Identifier(tabela_filtro2),
+                col=sql.Identifier(coluna_vol)
+            )
+            executar_sql(conexao, comando)
+
+            comando = sql.SQL("ALTER TABLE {table} DROP COLUMN IF EXISTS {col};").format(
+                table=sql.Identifier(tabela_filtro2),
+                col=sql.Identifier(coluna_seo)
+            )
+            executar_sql(conexao, comando)
+
+            # Adicionar coluna cidade_vol
+            comando = sql.SQL("ALTER TABLE {table} ADD COLUMN {col} INTEGER DEFAULT 0;").format(
+                table=sql.Identifier(tabela_filtro2),
+                col=sql.Identifier(coluna_vol)
+            )
+            executar_sql(conexao, comando)
+            print(f"Coluna {coluna_vol} adicionada com sucesso.")
+
+            # Adicionar coluna cidade_seo
+            comando = sql.SQL("ALTER TABLE {table} ADD COLUMN {col} INTEGER DEFAULT 0;").format(
+                table=sql.Identifier(tabela_filtro2),
+                col=sql.Identifier(coluna_seo)
+            )
+            executar_sql(conexao, comando)
+            print(f"Coluna {coluna_seo} adicionada com sucesso.")
+
+        # 4. Ler os arquivos CSV na pasta CIDADES
+        for arquivo_csv in os.listdir(dir_cidades):
+            if arquivo_csv.endswith(".csv"):
+                # Extrair o nome da cidade do nome do arquivo
+                cidade_arquivo = arquivo_csv.replace("ubersuggest_", "").replace(".csv", "").split(",")[0].strip()
+                cidade_arquivo = cidade_arquivo.replace("_", " ")
+
+                # Verificar se a cidade está na lista de cidades
+                if cidade_arquivo not in cidades:
+                    print(f"Cidade '{cidade_arquivo}' não encontrada na tabela de cidades. Ignorando arquivo.")
+                    continue
+
+                # Normalizar o nome da cidade do arquivo
+                cidade_arquivo_limpa = cidade_arquivo.replace("'", "").replace('"', "").replace(" ", "_").replace(".", "").lower()
+
+                # Ler o arquivo CSV
+                caminho_arquivo = os.path.join(dir_cidades, arquivo_csv)
+                try:
+                    df = pd.read_csv(caminho_arquivo)
+                except Exception as e:
+                    print(f"Erro ao ler o arquivo {caminho_arquivo}: {e}")
+                    continue
+
+                # Verificar se as colunas necessárias estão presentes
+                colunas_necessarias = ["Keyword", "Search Volume", "SEO Difficulty"]
+                if not all(col in df.columns for col in colunas_necessarias):
+                    print(f"Arquivo {caminho_arquivo} não contém as colunas necessárias. Ignorando.")
+                    continue
+
+                # Processar cada linha do arquivo CSV
+                for _, row in df.iterrows():
+                    keyword = row["Keyword"]
+                    search_volume = row["Search Volume"]
+                    seo_difficulty = row["SEO Difficulty"]
+
+                    # Atualizar a tabela {projeto}_filtro2
+                    coluna_vol = f"{cidade_arquivo_limpa}_vol"
+                    coluna_seo = f"{cidade_arquivo_limpa}_seo"
+
+                    comando = sql.SQL(""" UPDATE {table} SET {col_vol} = %s, {col_seo} = %s, total_search = COALESCE(total_search, 0) + %s WHERE keyword = %s;
+                    """).format(
+                        table=sql.Identifier(tabela_filtro2),
+                        col_vol=sql.Identifier(coluna_vol),
+                        col_seo=sql.Identifier(coluna_seo)
+                    )
+                    executar_sql(conexao, comando, (search_volume, seo_difficulty, search_volume, keyword))
+
+                # 5. Atualizar o campo 'pesquisado' na tabela {projeto}_cidades
+                comando = sql.SQL(""" UPDATE {table} SET pesquisado = TRUE WHERE cidade LIKE %s; """).format(table=sql.Identifier(tabela_cidades))
+                executar_sql(conexao, comando, (f"%{cidade_arquivo}%",))
+
+        print("Processamento concluído com sucesso.")
+
+    except Exception as e:
+        print(f"Erro durante o processamento: {e}")
+    finally:
+        # Fechar a conexão com o banco de dados
+        conexao.close()
+
+def EXTRAIR_BRIEFING(projeto):
+    """Extrai informações do arquivo PDF de briefing e salva em um arquivo de texto."""
+    # Caminho do arquivo PDF de briefing
+    briefing_pdf_path = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/OUTROS/BRIEFING.pdf"
+    briefing_txt_path = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/OUTROS/BRIEFING.txt"
+
+    # Configurações do Ollama
+    OLLAMA_HOST = "http://10.120.120.7:11434"  # Substitua pelo host correto
+    AGENTE_NOME = "agente_SEO"  # Nome do agente fixo
+    TEMPERATURA = 0.5  # Temperatura para controlar a criatividade das respostas
+
+    # Verificar se o arquivo PDF existe
+    if not os.path.exists(briefing_pdf_path):
+        print(f"Arquivo PDF de briefing não encontrado: {briefing_pdf_path}")
+        return
+
+    # Ler o conteúdo do arquivo PDF
+    try:
+        with open(briefing_pdf_path, "rb") as pdf_file:
+            reader = PyPDF2.PdfReader(pdf_file)
+            texto = ""
+            for page in reader.pages:
+                texto += page.extract_text()
+    except Exception as e:
+        print(f"Erro ao ler o arquivo PDF: {e}")
+        return
+
+    # Verificar se o Ollama está rodando
+    response = requests.get(f"{OLLAMA_HOST}/api/tags")
+    if response.status_code != 200:
+        print(f"Erro ao conectar ao Ollama: {response.status_code} - {response.text}")
+        return
+
+    print("Conexão com o Ollama estabelecida com sucesso.")
+
+    # Criar o prompt para o agente SEO
+    prompt = f"""
+    Extraia as seguintes informações do texto abaixo:
+    - Nome da Empresa
+    - Nome do estado onde atuam
+    - Nome das cidades onde atuam
+    - Serviços prestados (quando for o caso)
+    - Produtos vendidos (quando for o caso)
+    - Público-alvo
+
+    Texto:
+    {texto}
+    """
+
+    # Enviar o prompt para o agente SEO
+    response = requests.post(f"{OLLAMA_HOST}/api/generate", json={
+        "model": AGENTE_NOME,
+        "prompt": prompt,
+        "stream": False,
+        "temperature": TEMPERATURA  # Definindo a temperatura
+    })
+
+    if response.status_code == 200:
+        resposta = response.json().get("response", "").strip()
+        # Salvar a resposta no arquivo de texto
+        with open(briefing_txt_path, "w") as arquivo:
+            arquivo.write(resposta)
+        print(f"Informações extraídas e salvas em: {briefing_txt_path}")
+    else:
+        print(f"Erro ao consultar o agente: {response.status_code} - {response.text}")
+
+
+
+def EXTRAIR_BRIEFING(projeto):
+    """Extrai informações do arquivo PDF de briefing e salva em um arquivo de texto."""
+    # Caminho do arquivo PDF de briefing
+    briefing_pdf_path = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/OUTROS/BRIEFING.pdf"
+    briefing_txt_path = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/OUTROS/BRIEFING.txt"
+
+    # Configurações do Ollama
+    OLLAMA_HOST = "http://10.120.120.7:11434"  # Substitua pelo host correto
+    AGENTE_NOME = "agente_SEO"  # Nome do agente fixo
+    TEMPERATURA = 0.5  # Temperatura para controlar a criatividade das respostas
+
+    # Verificar se o arquivo PDF existe
+    if not os.path.exists(briefing_pdf_path):
+        print(f"Arquivo PDF de briefing não encontrado: {briefing_pdf_path}")
+        return
+
+    # Ler o conteúdo do arquivo PDF
+    try:
+        with open(briefing_pdf_path, "rb") as pdf_file:
+            reader = PyPDF2.PdfReader(pdf_file)
+            texto = ""
+            for page in reader.pages:
+                texto += page.extract_text()
+    except Exception as e:
+        print(f"Erro ao ler o arquivo PDF: {e}")
+        return
+
+    # Verificar se o Ollama está rodando
+    response = requests.get(f"{OLLAMA_HOST}/api/tags")
+    if response.status_code != 200:
+        print(f"Erro ao conectar ao Ollama: {response.status_code} - {response.text}")
+        return
+
+    print("Conexão com o Ollama estabelecida com sucesso.")
+
+    # Criar o prompt para o agente SEO
+    prompt = f"""
+    Extraia as seguintes informações do texto abaixo:
+    - Nome da Empresa
+    - Nome do estado onde atuam
+    - Nome das cidades onde atuam
+    - Serviços prestados (quando for o caso)
+    - Produtos vendidos (quando for o caso)
+    - Público-alvo
+
+    Texto:
+    {texto}
+    """
+
+    # Enviar o prompt para o agente SEO
+    response = requests.post(f"{OLLAMA_HOST}/api/generate", json={
+        "model": AGENTE_NOME,
+        "prompt": prompt,
+        "stream": False,
+        "temperature": TEMPERATURA  # Definindo a temperatura
+    })
+
+    if response.status_code == 200:
+        resposta = response.json().get("response", "").strip()
+        # Salvar a resposta no arquivo de texto
+        with open(briefing_txt_path, "w") as arquivo:
+            arquivo.write(resposta)
+        print(f"Informações extraídas e salvas em: {briefing_txt_path}")
+    else:
+        print(f"Erro ao consultar o agente: {response.status_code} - {response.text}")
+
+def RELATORIO2(projeto):
+    """Gera relatórios em formato CSV com base nos dados do banco de dados."""
+    # Diretórios e tabelas
+    dir_resumo = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/RESUMO"
+    tabela_filtro2 = f"{projeto}_filtro2".lower()
+    tabela_cidades = f"{projeto}_cidades".lower()
+    tabela_servicos = f"{projeto}_servicos".lower()
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    try:
+        # 1. Ler a tabela {projeto}_filtro2 e ordenar por total_search DESC
+        caminho_relatorio_pesquisa = os.path.join(dir_resumo, "Relatorio de Pesquisa.csv")
+        comando = sql.SQL("SELECT * FROM {table} ORDER BY total_search DESC;").format(table=sql.Identifier(tabela_filtro2))
+        with conexao.cursor() as cursor:
+            cursor.execute(comando)
+            colunas = [desc[0] for desc in cursor.description]
+            resultados = cursor.fetchall()
+
+        # Exportar para CSV com delimitador "|"
+        with open(caminho_relatorio_pesquisa, "w") as arquivo:
+            arquivo.write("|".join(colunas) + "\n")
+            for linha in resultados:
+                arquivo.write("|".join(map(str, linha)) + "\n")
+        print(f"Relatório de Pesquisa gerado: {caminho_relatorio_pesquisa}")
+
+        # 2. Ler a tabela {projeto}_filtro2 e ordenar por total_search DESC, filtrando por can_be_used = TRUE
+        caminho_relatorio_filtrado = os.path.join(dir_resumo, "Relatorio Filtrado.csv")
+        comando = sql.SQL("SELECT * FROM {table} WHERE can_be_used = TRUE AND service != 'SEM RELACAO' ORDER BY total_search DESC;").format(table=sql.Identifier(tabela_filtro2))
+        with conexao.cursor() as cursor:
+            cursor.execute(comando)
+            colunas = [desc[0] for desc in cursor.description]
+            resultados = cursor.fetchall()
+
+        # Exportar para CSV com delimitador "|"
+        with open(caminho_relatorio_filtrado, "w") as arquivo:
+            arquivo.write("|".join(colunas) + "\n")
+            for linha in resultados:
+                arquivo.write("|".join(map(str, linha)) + "\n")
+        print(f"Relatório Filtrado gerado: {caminho_relatorio_filtrado}")
+
+        # 3. Ler a tabela {projeto}_cidades
+        caminho_relatorio_cidades = os.path.join(dir_resumo, "Relatorio de Cidades Escolhidas.csv")
+        comando = sql.SQL("SELECT cidade FROM {table};").format(table=sql.Identifier(tabela_cidades))
+        with conexao.cursor() as cursor:
+            cursor.execute(comando)
+            colunas = [desc[0] for desc in cursor.description]
+            resultados = cursor.fetchall()
+
+        # Exportar para CSV com delimitador "|"
+        with open(caminho_relatorio_cidades, "w") as arquivo:
+            arquivo.write("|".join(colunas) + "\n")
+            for linha in resultados:
+                arquivo.write("|".join(map(str, linha)) + "\n")
+        print(f"Relatório de Cidades Escolhidas gerado: {caminho_relatorio_cidades}")
+
+        # 4. Ler a tabela {projeto}_servicos
+        caminho_relatorio_servicos = os.path.join(dir_resumo, "Relatorio de Lista de Servicos.csv")
+        comando = sql.SQL("SELECT servico FROM {table};").format(table=sql.Identifier(tabela_servicos))
+        with conexao.cursor() as cursor:
+            cursor.execute(comando)
+            colunas = [desc[0] for desc in cursor.description]
+            resultados = cursor.fetchall()
+
+        # Exportar para CSV com delimitador "|"
+        with open(caminho_relatorio_servicos, "w") as arquivo:
+            arquivo.write("|".join(colunas) + "\n")
+            for linha in resultados:
+                arquivo.write("|".join(map(str, linha)) + "\n")
+        print(f"Relatório de Lista de Serviços gerado: {caminho_relatorio_servicos}")
+
+        # 5. Ler apenas a coluna 'keyword' da tabela {projeto}_filtro2, ordenada por total_search DESC
+        caminho_keywords = os.path.join(dir_resumo, "keywords.txt")
+        comando = sql.SQL("SELECT keyword FROM {table} ORDER BY total_search DESC;").format(
+            table=sql.Identifier(tabela_filtro2)
+        )
+        
+        with conexao.cursor() as cursor:
+            cursor.execute(comando)
+            resultados = cursor.fetchall()  # Retorna uma lista de tuplas, onde cada tupla contém uma palavra-chave
+
+        # Salvar as palavras-chave no arquivo keywords.txt
+        with open(caminho_keywords, "w") as arquivo:
+            for linha in resultados:
+                arquivo.write(linha[0] + "\n")  # linha[0] porque cada resultado é uma tupla com um único elemento (a palavra-chave)
+
+        print(f"Arquivo de palavras-chave gerado com sucesso: {caminho_keywords}")
+
+    except Exception as e:
+        print(f"Erro ao gerar o arquivo de palavras-chave: {e}")
+
+
+    except Exception as e:
+        print(f"Erro durante o processamento: {e}")
+    finally:
+        # Fechar a conexão com o banco de dados
+        conexao.close()
+
+def RELATORIO1(projeto):
+    """Gera relatórios em formato XLSX com base nos dados do banco de dados."""
+    import pandas as pd
+    from psycopg2 import sql
+
+    # Diretórios e tabelas
+    dir_resumo = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/RESUMO"
+    tabela_filtro2 = f"{projeto}_filtro2".lower()
+    tabela_cidades = f"{projeto}_cidades".lower()
+    tabela_servicos = f"{projeto}_servicos".lower()
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    # 1. Ler a tabela {projeto}_filtro2 e ordenar por total_search DESC
+    comando = sql.SQL("SELECT * FROM {table} ORDER BY total_search DESC;").format(table=sql.Identifier(tabela_filtro2))
+    df_relatorio_pesquisa = pd.read_sql_query(str(comando), conexao)  # Convertendo para string
+
+    # 2. Ler a tabela {projeto}_filtro2 e ordenar por total_search DESC, filtrando por can_be_used = TRUE
+    comando = sql.SQL("SELECT * FROM {table} WHERE can_be_used = TRUE ORDER BY total_search DESC;").format(table=sql.Identifier(tabela_filtro2))
+    df_relatorio_filtrado = pd.read_sql_query(str(comando), conexao)  # Convertendo para string
+
+    # 3. Ler a tabela {projeto}_cidades
+    comando = sql.SQL("SELECT * FROM {table};").format(table=sql.Identifier(tabela_cidades))
+    df_cidades_escolhidas = pd.read_sql_query(str(comando), conexao)  # Convertendo para string
+
+    # 4. Ler a tabela {projeto}_servicos
+    comando = sql.SQL("SELECT * FROM {table};").format(table=sql.Identifier(tabela_servicos))
+    df_lista_servicos = pd.read_sql_query(str(comando), conexao)  # Convertendo para string
+
+    # 5. Criar a tabela "Palavras-chaves Escolhidas"
+    # Selecionar as palavras-chave mais relevantes (top 10 por volume)
+    comando = sql.SQL("""
+        SELECT keyword AS "PALAVRAS-CHAVE", total_search AS "VOLUME"
+        FROM {table}
+        WHERE can_be_used = TRUE
+        ORDER BY total_search DESC
+        LIMIT 10;
+    """).format(table=sql.Identifier(tabela_filtro2))
+    df_palavras_chaves = pd.read_sql_query(str(comando), conexao)  # Convertendo para string
+
+    # Adicionar a coluna "PÁGINAS" com valores vazios
+    df_palavras_chaves.insert(0, "PÁGINAS", "")
+
+    # Exportar tudo para um único arquivo XLSX
+    caminho_relatorio = os.path.join(dir_resumo, "Relatório de Pesquisa.xlsx")
+    with pd.ExcelWriter(caminho_relatorio, engine="openpyxl") as writer:
+        df_relatorio_pesquisa.to_excel(writer, sheet_name="Relatorio de Pesquisa", index=False)
+        df_relatorio_filtrado.to_excel(writer, sheet_name="Relatorio Filtrado", index=False)
+        df_cidades_escolhidas.to_excel(writer, sheet_name="Cidades Escolhidas", index=False)
+        df_lista_servicos.to_excel(writer, sheet_name="Lista de Serviços", index=False)
+        df_palavras_chaves.to_excel(writer, sheet_name="Palavras-chaves Escolhidas", index=False)
+
+    print(f"Relatório gerado com sucesso: {caminho_relatorio}")
+
+    # Fechar a conexão com o banco de dados
+    conexao.close()
+
+def FILTRO1(projeto):
+    """Analisa os dados dos concorrentes e insere as palavras-chave mais relevantes na tabela de palavras."""
+    # Diretórios e tabelas
+    dir_outros = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/OUTROS"
+    tabela_concorrentes_palavras = f"{projeto}_concorrentes_palavras".lower()
+    tabela_filtro1 = f"{projeto}_filtro1".lower()
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    # Navegar até o diretório de outros arquivos
+    os.chdir(dir_outros)
+
+    # Consultar palavras-chave distintas com maior volume de busca, ordenadas por search_volume e timestamp
+    comando = sql.SQL("""
+        SELECT DISTINCT keyword, search_volume, keyword_difficulty, keyword_intents, timestamp 
+        FROM {table} 
+        ORDER BY search_volume DESC, timestamp DESC LIMIT 10000
+    """).format(table=sql.Identifier(tabela_concorrentes_palavras))
+
+    with conexao.cursor() as cursor:
+        cursor.execute(comando)
+        resultados = cursor.fetchall()
+
+    # Salvar os resultados em um arquivo temporário
+    caminho_temporario = "Lista-palavras-chaves.txt"
+    with open(caminho_temporario, "w") as arquivo:
+        for linha in resultados:
+            arquivo.write("|".join(map(str, linha)) + "\n")
+
+    # Inserir as palavras-chave na tabela de palavras
+    with open(caminho_temporario, "r") as arquivo:
+        for linha in arquivo:
+            partes = linha.strip().split("|")
+            if len(partes) >= 4:  # Garante que há pelo menos 4 colunas
+                key, vol, dif, intent = partes[:4]  # Pega apenas as 4 primeiras colunas
+                comando = sql.SQL("""
+                    INSERT INTO {table} (keyword, search_volume, keyword_difficulty, keyword_intents)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (keyword) DO NOTHING;
+                """).format(table=sql.Identifier(tabela_filtro1))
+                executar_sql(conexao, comando, (key, vol, dif, intent))
+            else:
+                print(f"Linha mal formatada: {linha}")
+
+    print("Análise concluída e palavras-chave inseridas na tabela de palavras.")
+
+
+def GERAR_RELATORIOS_CSV(projeto):
+    """Gera relatórios CSV a partir das tabelas filtro1 e filtro2."""
+    # Diretório onde os relatórios serão salvos
+    dir_resumo = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/RESUMO"
+    
+    # Nomes das tabelas
+    tabela_filtro1 = f"{projeto}_filtro1".lower()
+    tabela_filtro2 = f"{projeto}_filtro2".lower()
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    try:
+        # 1. Gerar relatório da tabela filtro1
+        caminho_relatorio1 = os.path.join(dir_resumo, "relatorio1.csv")
+        comando_filtro1 = sql.SQL("SELECT * FROM {table} ORDER BY search_volume DESC;").format(
+            table=sql.Identifier(tabela_filtro1)
+        )
+        
+        with conexao.cursor() as cursor:
+            cursor.execute(comando_filtro1)
+            colunas = [desc[0] for desc in cursor.description]  # Nomes das colunas
+            resultados = cursor.fetchall()
+
+        # Salvar os resultados em um arquivo CSV
+        with open(caminho_relatorio1, "w") as arquivo:
+            # Escrever o cabeçalho (nomes das colunas)
+            arquivo.write("|".join(colunas) + "\n")
+            # Escrever os dados
+            for linha in resultados:
+                arquivo.write("|".join(map(str, linha)) + "\n")
+        
+        print(f"Relatório 1 gerado com sucesso: {caminho_relatorio1}")
+
+        # 2. Gerar relatório da tabela filtro2
+        caminho_relatorio2 = os.path.join(dir_resumo, "relatorio2.csv")
+        comando_filtro2 = sql.SQL("SELECT * FROM {table} ORDER BY total_search DESC;").format(
+            table=sql.Identifier(tabela_filtro2)
+        )
+        
+        with conexao.cursor() as cursor:
+            cursor.execute(comando_filtro2)
+            colunas = [desc[0] for desc in cursor.description]  # Nomes das colunas
+            resultados = cursor.fetchall()
+
+        # Salvar os resultados em um arquivo CSV
+        with open(caminho_relatorio2, "w") as arquivo:
+            # Escrever o cabeçalho (nomes das colunas)
+            arquivo.write("|".join(colunas) + "\n")
+            # Escrever os dados
+            for linha in resultados:
+                arquivo.write("|".join(map(str, linha)) + "\n")
+        
+        print(f"Relatório 2 gerado com sucesso: {caminho_relatorio2}")
+
+    except Exception as e:
+        print(f"Erro ao gerar relatórios: {e}")
+
+    finally:
+        # Fechar a conexão com o banco de dados
+        conexao.close()
+
+
+def ESCOPO1(projeto):
+    """Gera o escopo de construção do site com base nos dados do projeto."""
+    # Diretórios e tabelas
+    tabela_filtro2 = f"{projeto}_filtro2".lower()
+    tabela_cidades = f"{projeto}_cidades".lower()
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    # Buscar cidades marcadas como 'true'
+    comando = sql.SQL("SELECT cidade FROM {table} WHERE usar = TRUE;").format(table=sql.Identifier(tabela_cidades))
+    with conexao.cursor() as cursor:
+        cursor.execute(comando)
+        cidades = [row[0] for row in cursor.fetchall()]
+
+    # Exibir escopo para a página Home
+    print("=" * 50)
+    print(f"Escopo de Construção do Site - {projeto}")
+    print("=" * 50)
+    print("\n1. Menu - Home")
+    comando = sql.SQL("""
+        SELECT keyword FROM {table}
+        ORDER BY total_volume DESC LIMIT 1;
+    """).format(table=sql.Identifier(tabela_filtro2))
+    with conexao.cursor() as cursor:
+        cursor.execute(comando)
+        palavra_chave_principal = cursor.fetchone()[0]
+    print(f"   1. Palavra-chave Principal: {palavra_chave_principal}")
+
+    comando = sql.SQL("""
+        SELECT keyword FROM {table}
+        ORDER BY total_volume DESC LIMIT 5 OFFSET 1;
+    """).format(table=sql.Identifier(tabela_filtro2))
+    with conexao.cursor() as cursor:
+        cursor.execute(comando)
+        palavras_chaves_secundarias = ", ".join([row[0] for row in cursor.fetchall()])
+    print(f"   2. Palavras-chaves Secundárias: {palavras_chaves_secundarias}")
+
+    comando = sql.SQL("""
+        SELECT SUM(total_volume) FROM {table};
+    """).format(table=sql.Identifier(tabela_filtro2))
+    with conexao.cursor() as cursor:
+        cursor.execute(comando)
+        volume_total = cursor.fetchone()[0]
+    print(f"   3. Volume de Buscas Total: {volume_total}")
+
+    print("   4. Seções da Página:")
+    print("      1. Título")
+    print("      2. Introdução à empresa")
+    print("      3. Serviços oferecidos")
+    print("      4. Galeria de projetos")
+    print("      5. Depoimentos de clientes")
+    print("      6. Chamado para ação (CTA)")
+    print("   5. Resumo do Conteúdo: A página inicial introduzirá a empresa, destacando os principais serviços oferecidos, com foco nas cidades atendidas.")
+
+    # Fechar a conexão com o banco de dados
+    conexao.close()
+
+def ESCOPO2(projeto):
+    """Gera um escopo detalhado de construção do site com base nos dados do projeto."""
+    # Diretórios e tabelas
+    tabela_filtro2 = f"{projeto}_filtro2".lower()
+    tabela_cidades = f"{projeto}_cidades".lower()
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    # Buscar cidades marcadas como 'true'
+    comando = sql.SQL("SELECT cidade FROM {table} WHERE usar = TRUE;").format(table=sql.Identifier(tabela_cidades))
+    with conexao.cursor() as cursor:
+        cursor.execute(comando)
+        cidades = [row[0] for row in cursor.fetchall()]
+
+    # Exibir escopo para a página Home
+    print("=" * 50)
+    print(f"Escopo de Construção do Site - {projeto}")
+    print("=" * 50)
+    print("\nMenu - Home")
+    comando = sql.SQL("""
+        SELECT keyword FROM {table}
+        ORDER BY total_volume DESC LIMIT 1;
+    """).format(table=sql.Identifier(tabela_filtro2))
+    with conexao.cursor() as cursor:
+        cursor.execute(comando)
+        palavra_chave_principal = cursor.fetchone()[0]
+    print(f"   Palavra-chave Principal: {palavra_chave_principal}")
+
+    comando = sql.SQL("""
+        SELECT keyword FROM {table}
+        ORDER BY total_volume DESC LIMIT 8 OFFSET 1;
+    """).format(table=sql.Identifier(tabela_filtro2))
+    with conexao.cursor() as cursor:
+        cursor.execute(comando)
+        palavras_chaves_secundarias = ", ".join([row[0] for row in cursor.fetchall()])
+    print(f"   Palavras-chaves Secundárias: {palavras_chaves_secundarias}")
+
+    comando = sql.SQL("""
+        SELECT SUM(total_volume) FROM {table};
+    """).format(table=sql.Identifier(tabela_filtro2))
+    with conexao.cursor() as cursor:
+        cursor.execute(comando)
+        volume_total = cursor.fetchone()[0]
+    print(f"   Volume de Buscas Total: {volume_total}")
+
+    print("   Seções da Página:")
+    print("      1. Título")
+    print("      2. Subtítulo")
+    print("      3. Introdução à empresa")
+    print("      4. Serviços oferecidos")
+    print("      5. Galeria de projetos")
+    print("      6. Depoimentos de clientes")
+    print("      7. Chamado para ação (CTA)")
+    print("      8. FAQs")
+    print("   Resumo do Conteúdo: A página inicial introduzirá a empresa, destacando os principais serviços oferecidos, com foco nas cidades atendidas.")
+
+    # Exibir escopo para a página Services
+    comando = sql.SQL("SELECT DISTINCT service FROM {table} WHERE service IS NOT NULL ORDER BY service;").format(
+        table=sql.Identifier(tabela_filtro2)
+    )
+    with conexao.cursor() as cursor:
+        cursor.execute(comando)
+        servicos = [row[0] for row in cursor.fetchall()]
+
+    print("\nMenu - Services")
+    volume_total_servicos = 0
+    for servico in servicos:
+        comando = sql.SQL("""
+            SELECT keyword FROM {table}
+            WHERE service = %s
+            ORDER BY total_search DESC LIMIT 8;
+        """).format(table=sql.Identifier(tabela_filtro2))
+        with conexao.cursor() as cursor:
+            cursor.execute(comando, (servico,))
+            palavras_chaves = [row[0] for row in cursor.fetchall()]
+
+        comando = sql.SQL("""
+            SELECT SUM(total_volume) FROM (
+                SELECT total_volume FROM {table}
+                WHERE service = %s
+                ORDER BY total_volume DESC, total_search DESC LIMIT 8
+            ) AS top_searches;
+        """).format(table=sql.Identifier(tabela_filtro2))
+        with conexao.cursor() as cursor:
+            cursor.execute(comando, (servico,))
+            volume_servico = cursor.fetchone()[0] or 0
+        volume_total_servicos += volume_servico
+
+        print(f"\n   Serviço: {servico}")
+        print(f"      Palavra-chave Principal: {palavras_chaves[0]}")
+        print(f"      Palavras-chaves Secundárias: {', '.join(palavras_chaves[1:])}")
+        print(f"      Volume de Buscas Total: {volume_servico}")
+        print("      Seções da Página:")
+        print("         1. Visão geral do serviço")
+        print("         2. Etapas do processo")
+        print("         3. Galeria de projetos")
+        print("         4. Depoimentos de clientes")
+        print("         5. FAQs sobre o serviço")
+        print("      Resumo do Conteúdo: A página destacará o serviço, descrevendo todas as etapas do processo e respondendo às principais dúvidas dos clientes.")
+
+    print(f"\nVolume Total de Buscas para Todos os Serviços: {volume_total_servicos}")
+
+    # Fechar a conexão com o banco de dados
+    conexao.close()
+
+def INSTRU(projeto):
+    """Gera instruções detalhadas para a criação de conteúdo baseado nos dados do projeto."""
+    # Diretórios e tabelas
+    tabela_filtro2 = f"{projeto}_filtro2".lower()
+    tabela_cidades = f"{projeto}_cidades".lower()
+    dir_resumo = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/RESUMO"
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    # Obter palavras-chave principais e secundárias
+    comando = sql.SQL("""
+        SELECT keyword FROM {table} ORDER BY total_volume DESC LIMIT 8;
+    """).format(table=sql.Identifier(tabela_filtro2))
+    with conexao.cursor() as cursor:
+        cursor.execute(comando)
+        palavras_chaves = [row[0] for row in cursor.fetchall()]
+    palavras_chaves_str = ", ".join(palavras_chaves)
+
+    # Obter cidades marcadas como 'true'
+    comando = sql.SQL("SELECT cidade FROM {table} WHERE usar = TRUE;").format(table=sql.Identifier(tabela_cidades))
+    with conexao.cursor() as cursor:
+        cursor.execute(comando)
+        cidades = [row[0] for row in cursor.fetchall()]
+    cidades_str = ", ".join(cidades)
+
+    # Briefing básico
+    briefing = f"""
+Informações Básicas:
+    Responsável: Rafael Almeida.
+    Contato: +1 (857) 236-7746 / rafaelusamerica@hotmail.com.
+    Empresa: Nome ainda em definição.
+    Endereço: O mesmo do contrato.
+    Horário de atendimento: Segunda a domingo, das 7h às 17h.
+    Feriados sem funcionamento: Thanksgiving, Natal e 1º de janeiro.
+
+Cidades atendidas: 
+    {cidades_str}
+
+Formas de Pagamento:
+    Zelle/Venmo, dinheiro, cheque, cartão de crédito e débito.
+
+Presença Digital:
+    Site: Contratado, mas ainda não possui domínio, hospedagem ou email institucional.
+    Redes Sociais: Contratou serviços para Facebook/Instagram, com disponibilidade para criar conteúdo e gravar vídeos.
+    Identidade Visual: Contratou serviço, com preferência por elementos que remetam à bandeira dos Estados Unidos e cores como azul e cinza.
+
+Serviços Oferecidos:
+    Instalação e montagem, reparos gerais, carpintaria, limpeza e manutenção, e serviços pesados como demolição.
+
+Diferenciais:
+    Foco na qualidade, satisfação do cliente e atendimento acessível.
+    Garantia de 15 a 30 dias para os serviços prestados.
+
+Público-Alvo:
+    Famílias e indústrias, principalmente homens e mulheres de 50 a 60 anos, de classe média.
+    Personas: Suburban Homeowner (35-60 anos) e idosos/aposentados (60-80 anos).
+
+Concorrentes e Pontos Fortes/Fracos:
+    Concorrentes: Ainda não identificados.
+    Pontos fortes: Dinamismo e busca pela qualidade.
+    Pontos fracos: Falta de experiência de mercado.
+
+Visão Futura:
+    Em 5 anos: Aprimorar métodos e competir com empresas estabelecidas.
+    Em 10 anos: Expandir para outras cidades e estados.
+"""
+
+    # Instruções de escrita
+    copywriting_instructions = """
+SEO TITLE deve ter no máximo 60 caracteres e usar a palavra-chave primária;
+
+CABEÇALHO H1 escrito entre os caracteres 
+, em inglês, usando a palavra-chave principal, que é a primeira palavra-chave fornecida.
+Meta Description referente ao CABEÇALHO H1 que deve ter no máximo 150 caracteres, escrito em inglês, usando a palavra-chave principal, que é a primeira palavra-chave fornecida.
+Texto escrito em inglês referente ao CABEÇALHO H1 usando a palavra-chave primária (primeira palavra-chave fornecida), com no máximo 300 caracteres em 1 ou 2 parágrafos.
+
+CABEÇALHO H2 escrito entre os caracteres 
+, em inglês, usando uma das palavras-chaves secundárias.
+Meta Description referente ao CABEÇALHO H2, deve ter no máximo 150 caracteres, escrito em inglês, usando uma das palavras-chaves secundárias.
+Texto escrito em inglês usando uma ou mais das palavras-chaves secundárias, com no máximo 400 caracteres em 1 ou 2 parágrafos.
+
+CABEÇALHO H3 escrito entre 
+, falando sobre os serviços oferecidos, em inglês, usando uma das palavras-chaves secundárias.
+Meta Description referente ao CABEÇALHO H3, deve ter no máximo 150 caracteres, escrito em inglês, usando uma das palavras-chaves secundárias.
+Texto escrito em inglês usando mais de uma das palavras-chaves secundárias usando bullet points mostrando o diferencial da empresa e serviços.
+
+CTA escreva uma CTA chamando o público para agendar uma consulta. Escreva em inglês, use no máximo 50 caracteres.
+
+Caso precise inserir imagens,
+    Insira instruções em português para adicionar imagens dos serviços realizados.
+    Embaixo do item acima escreva a "Alt TAGS" referente às imagens acima, deve ter no máximo 150 caracteres, escrito em inglês, usando uma ou mais das palavras-chaves secundárias.
+"""
+
+    # Gerar instruções para cada página
+    paginas = ["Home", "About Us", "Privacy Policy"]
+    for pagina in paginas:
+        caminho_arquivo = os.path.join(dir_resumo, f"INSTRUCAO-{pagina.replace(' ', '-')}.txt")
+        with open(caminho_arquivo, "w") as arquivo:
+            arquivo.write(briefing)
+            arquivo.write("\n" + "=" * 50 + "\n")
+            arquivo.write(copywriting_instructions)
+            arquivo.write(f"\nPágina: {pagina}\n")
+            arquivo.write(f"Palavras-chave: {palavras_chaves_str}\n")
+            arquivo.write(f"URL: /{pagina.lower().replace(' ', '-')}\n")
+            arquivo.write("Menu: HOME | SERVICES | LOCATIONS | ABOUT US | PRIVACY POLICY\n")
+            arquivo.write(f"Empresa: {projeto}\n")
+
+    print("Instruções geradas com sucesso.")
+
+def DELETAR(projeto):
+    """Remove palavras-chave indesejadas da tabela de palavras."""
+    # Diretórios e tabelas
+    tabela_filtro1 = f"{projeto}_filtro1".lower()
+    dir_outros = f"/home/jaugusto/OUTROS/TRABALHOS/THEMINDS/{projeto}/OUTROS"
+
+    # Conectar ao banco de dados
+    conexao = conectar_banco()
+
+    # Remover palavras-chave com intenção 'informational'
+    comando = sql.SQL("DELETE FROM {table} WHERE keyword_intents LIKE '%informational%';").format(
+        table=sql.Identifier(tabela_filtro1)
+    )
+    executar_sql(conexao, comando)
+
+    # Ler palavras a serem excluídas do arquivo PALAVRAS_EXCLUIR.txt
+    caminho_excluir = os.path.join(dir_outros, "PALAVRAS_EXCLUIR.txt")
+    if os.path.exists(caminho_excluir):
+        with open(caminho_excluir, "r") as arquivo:
+            palavras_excluir = arquivo.read().splitlines()
+
+        for palavra in palavras_excluir:
+            comando = sql.SQL("DELETE FROM {table} WHERE keyword LIKE %s;").format(
+                table=sql.Identifier(tabela_filtro1)
+            )
+            executar_sql(conexao, comando, (f"%{palavra}%",))
+
+    print("Palavras-chave indesejadas removidas com sucesso.")
+
+import sys
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print("Uso: python PROJETO.py {nomedoprojeto} função")
+        sys.exit(1)
+
+    projeto = sys.argv[1]
+    funcao = sys.argv[2]
+
+    if funcao == "escopo":
+        ESCOPO1(projeto)
+
+    elif funcao == "escopo2":
+        ESCOPO2(projeto)
+
+    elif funcao == "drop":
+        drop_tabelas(projeto)
+
+    elif funcao == "criar":
+        criar_diretorios(projeto)
+        drop_tabelas(projeto)
+        criar_tabelas(projeto)
+
+    elif funcao == "pesquisa_cidades":
+        pesquisa_cidades(projeto)
+
+    elif funcao == "relatorio":
+        RELATORIO2(projeto)
+
+    elif funcao == "inserir":
+        inserir_servicos(projeto)
+        inserir_concorrentes_nomes(projeto)
+        inserir_concorrentes_palavras(projeto)
+        INSERIR_CIDADES(projeto)
+
+    elif funcao == "pesquisa":
+        PESQUISA(projeto)
+
+    elif funcao == "cidades":
+        INSERIR_CIDADES(projeto)
+
+    elif funcao == "filtro1":
+        FILTRO1(projeto)
+
+    elif funcao == "filtro2":
+        FILTRO2(projeto)
+    
+    elif funcao == "filtro3":
+        FILTRO3(projeto)
+    
+    elif funcao == "filtro4":
+        FILTRO4(projeto)
+   
+   
+    elif funcao == "extrair_briefing":
+        EXTRAIR_BRIEFING(projeto)
+
+    elif funcao == "inicial":
+        criar_diretorios(projeto)
+        drop_tabelas(projeto)
+        criar_tabelas(projeto)
+        inserir_servicos(projeto)
+        inserir_concorrentes_nomes(projeto)
+        inserir_concorrentes_palavras(projeto)
+        INSERIR_CIDADES(projeto)
+
+    elif funcao == "analisar":
+        EXTRAIR_BRIEFING(projeto)
+        FILTRO1(projeto)
+        FILTRO2(projeto)
+        FILTRO3(projeto)
+        FILTRO4(projeto)
+
+    elif funcao == "instrucoes":
+        INSTRU(projeto)
+
+    elif funcao == "deletar":
+        DELETAR(projeto)
+        drop_tabelas(projeto)
+
+    elif funcao == "fase1":
+        criar_diretorios(projeto)
+        drop_tabelas(projeto)
+        criar_tabelas(projeto)
+        inserir_servicos(projeto)
+        inserir_concorrentes_nomes(projeto)
+        inserir_concorrentes_palavras(projeto)
+        INSERIR_CIDADES(projeto)
+
+    elif funcao == "fase2":
+        EXTRAIR_BRIEFING(projeto)
+        FILTRO1(projeto)
+        FILTRO2(projeto)
+        FILTRO3(projeto)
+        FILTRO4(projeto)
+        RELATORIO2(projeto)
+    
+    elif funcao == "todos":
+        criar_diretorios(projeto)
+        drop_tabelas(projeto)
+        criar_tabelas(projeto)
+        inserir_servicos(projeto)
+        inserir_concorrentes_nomes(projeto)
+        inserir_concorrentes_palavras(projeto)
+        INSERIR_CIDADES(projeto)
+        EXTRAIR_BRIEFING(projeto)
+        FILTRO1(projeto)
+        FILTRO2(projeto)
+        FILTRO3(projeto)
+        FILTRO4(projeto)
+        RELATORIO2(projeto)
+
+    elif funcao == "cidades":
+        INSERIR_CIDADES(projeto)
+    
+    else:
+        print(f"Função '{funcao}' não reconhecida.")
+        sys.exit(1)
